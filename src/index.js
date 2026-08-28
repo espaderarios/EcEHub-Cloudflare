@@ -3,21 +3,28 @@ import { getDocumentProxy } from 'unpdf';
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 const MAX_AUTO_SCAN_PAGES = 120;
 const MAX_CHAPTER_PAGES = 80;
-const MAX_SOURCE_CHARS = 18000;
-const MAX_INSTRUCTIONS_CHARS = 800;
+
+// Keep the prompt comfortably below Groq's 8K TPM limit. Character limits are
+// deliberately conservative because token counts vary by textbook formatting.
+const MAX_SOURCE_CHARS = 7000;
+const MAX_INSTRUCTIONS_CHARS = 500;
 const MAX_CHAPTER_QUERY_CHARS = 120;
 const MAX_CARD_COUNT = 20;
-const MAX_OUTPUT_TOKENS = 700;
+const MAX_COMPLETION_TOKENS = 500;
+const MAX_RETRIES = 2;
 
 const ALLOWED_DIFFICULTIES = new Set(['easy', 'medium', 'hard']);
 
 function json(data, status = 200, origin = '*') {
-  return new Response(JSON.stringify(data), { status, headers: {
-    'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': origin,
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'Content-Type, Authorization'
-  }});
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': origin,
+      'access-control-allow-methods': 'GET,POST,OPTIONS',
+      'access-control-allow-headers': 'Content-Type, Authorization'
+    }
+  });
 }
 
 function corsOrigin(request, env) {
@@ -36,7 +43,7 @@ function extractDriveFileId(inputUrl) {
   try { url = new URL(inputUrl); } catch {
     throw Object.assign(new Error('Invalid Google Drive URL.'), { statusCode: 400 });
   }
-  const allowedHosts = new Set(['drive.google.com','www.drive.google.com','docs.google.com','drive.usercontent.google.com']);
+  const allowedHosts = new Set(['drive.google.com', 'www.drive.google.com', 'docs.google.com', 'drive.usercontent.google.com']);
   if (!allowedHosts.has(url.hostname)) throw Object.assign(new Error('Only Google Drive PDF links are supported.'), { statusCode: 400 });
   const pathMatch = url.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
   if (pathMatch?.[1]) return pathMatch[1];
@@ -141,13 +148,28 @@ async function extractSelectedPages(pdf, startPage, endPage) {
     const text = await getPageText(pdf, pageNumber);
     if (text) pages.push(`[PDF page ${pageNumber}]\n${text}`);
   }
-  let combined = pages.join('\n\n');
-  let truncatedText = false;
-  if (combined.length > MAX_SOURCE_CHARS) {
-    combined = combined.slice(0, MAX_SOURCE_CHARS) + '\n\n[Chapter text truncated by the AI backend.]';
-    truncatedText = true;
-  }
-  return { text: combined, pages: pages.length, startPage, endPage: actualEnd, truncatedPages: endPage > actualEnd, truncatedText };
+  const fullText = pages.join('\n\n');
+  const text = compactSourceText(fullText, MAX_SOURCE_CHARS);
+  return {
+    text,
+    pages: pages.length,
+    startPage,
+    endPage: actualEnd,
+    truncatedPages: endPage > actualEnd,
+    truncatedText: text.length < fullText.length
+  };
+}
+
+function compactSourceText(text, maxChars) {
+  if (text.length <= maxChars) return text;
+
+  // Preserve the beginning and end of the selected chapter instead of sending
+  // only the first N characters. This keeps definitions and conclusions useful.
+  const headChars = Math.floor(maxChars * 0.65);
+  const tailChars = maxChars - headChars;
+  return text.slice(0, headChars) +
+    '\n\n[Middle of chapter excerpt omitted to stay within the AI token budget.]\n\n' +
+    text.slice(-tailChars);
 }
 
 async function extractChapterText(pdfBytes, chapterQuery, explicitRange = null) {
@@ -167,27 +189,26 @@ async function extractChapterText(pdfBytes, chapterQuery, explicitRange = null) 
 }
 
 function buildPrompt({ text, chapters, cardCount, difficulty, instructions }) {
-  return `You are EcE Hub's flashcard specialist. Create exactly ${cardCount} high-quality study flashcard${cardCount === 1 ? '' : 's'} from ONLY the supplied textbook chapter excerpt.
+  return `Create exactly ${cardCount} useful study flashcard${cardCount === 1 ? '' : 's'} from ONLY this textbook excerpt.
 
 Chapter: ${chapters}
 Difficulty: ${difficulty}
 Instructions: ${instructions || 'None'}
 
-Requirements:
-- Use only information explicitly present in the excerpt.
-- Test important concepts, definitions, principles, relationships, formulas, mechanisms, or distinctions.
-- Do not invent facts or examples.
-- Make each question specific and useful for studying.
-- Make each answer concise but complete.
+Rules:
+- Use only facts explicitly present in the excerpt.
+- Test important concepts, definitions, principles, formulas, mechanisms, or distinctions.
+- Do not invent information.
+- Questions must be specific and useful for studying.
+- Answers must be concise and complete.
 - Avoid duplicates and trivial wording.
-- Return JSON only with exactly these fields: title, subject, description, cards.
-- cards must contain exactly ${cardCount} objects, each with question and answer strings.
+- Return only the JSON object required by the schema.
 
-SOURCE EXCERPT:
+EXCERPT:
 ${text}`;
 }
 
-function responseFormat() {
+function responseFormat(cardCount) {
   return {
     type: 'json_schema',
     json_schema: {
@@ -201,6 +222,8 @@ function responseFormat() {
           description: { type: 'string' },
           cards: {
             type: 'array',
+            minItems: cardCount,
+            maxItems: cardCount,
             items: {
               type: 'object',
               properties: { question: { type: 'string' }, answer: { type: 'string' } },
@@ -216,22 +239,32 @@ function responseFormat() {
   };
 }
 
-async function callGroq(env, args, structured = true) {
-  const body = {
-    model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
-    messages: [
-      { role: 'system', content: 'You create accurate educational flashcards from supplied source text. Output only the requested JSON object.' },
-      { role: 'user', content: buildPrompt(args) }
-    ],
-    temperature: 0.2,
-    max_completion_tokens: Math.min(MAX_OUTPUT_TOKENS, Math.max(250, 180 + args.cardCount * 90)),
-    reasoning_format: 'hidden'
-  };
-  if (structured) body.response_format = responseFormat();
+function completionBudget(cardCount) {
+  // Small fixed budget for the free 8K TPM tier. One card needs very little output.
+  return Math.min(MAX_COMPLETION_TOKENS, Math.max(180, 120 + cardCount * 45));
+}
+
+function retryDelayMs(attempt, message = '') {
+  const match = String(message).match(/try again in\s+([0-9.]+)s/i);
+  if (match) return Math.min(30000, Math.max(1000, Math.ceil(Number(match[1]) * 1000)));
+  return Math.min(8000, 1500 * (attempt + 1));
+}
+
+async function callGroq(env, args) {
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify({
+      model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
+      messages: [
+        { role: 'system', content: 'Create accurate educational flashcards from the supplied source. Output only the requested JSON object.' },
+        { role: 'user', content: buildPrompt(args) }
+      ],
+      temperature: 0.1,
+      max_completion_tokens: completionBudget(args.cardCount),
+      reasoning_format: 'hidden',
+      response_format: responseFormat(args.cardCount)
+    })
   });
   const data = await response.json();
   return { response, data };
@@ -240,46 +273,53 @@ async function callGroq(env, args, structured = true) {
 async function generateFlashcards(env, args) {
   if (!env.GROQ_API_KEY) throw new Error('GROQ_API_KEY is not configured in Cloudflare.');
 
-  let result = await callGroq(env, args, true);
-  let data = result.data;
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const result = await callGroq(env, args);
+    const data = result.data;
 
-  // GPT-OSS supports strict Structured Outputs. If Groq rejects the schema for
-  // any transient/model-specific reason, retry once with JSON Object Mode so a
-  // valid JSON response can still be parsed by the Worker.
-  if (!result.response.ok && result.response.status === 400) {
-    console.warn('Structured flashcard generation failed; retrying with JSON mode.', data?.error);
-    result = await callGroq(env, args, false);
-    data = result.data;
-  }
+    if (result.response.ok) {
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) throw new Error('Groq returned an empty response.');
 
-  if (!result.response.ok) {
+      let parsed;
+      try { parsed = JSON.parse(content); } catch {
+        throw new Error('AI returned invalid JSON.');
+      }
+
+      const cards = Array.isArray(parsed.cards)
+        ? parsed.cards
+            .map(card => ({ question: String(card?.question || '').trim(), answer: String(card?.answer || '').trim() }))
+            .filter(card => card.question && card.answer)
+            .slice(0, args.cardCount)
+        : [];
+
+      if (cards.length < args.cardCount) {
+        throw new Error(`AI generated ${cards.length} usable cards, but ${args.cardCount} were requested.`);
+      }
+
+      return {
+        title: String(parsed.title || args.chapters || 'AI Generated Flashcards').trim(),
+        subject: String(parsed.subject || 'Electronics Engineering').trim(),
+        description: String(parsed.description || `Flashcards generated from ${args.chapters}.`).trim(),
+        cards
+      };
+    }
+
     const groqError = data?.error;
     const message = groqError?.message || `Groq returned HTTP ${result.response.status}.`;
-    throw Object.assign(new Error(message), {
-      statusCode: result.response.status === 429 || result.response.status === 413 ? 429 : 502,
-      groqError
-    });
+    lastError = Object.assign(new Error(message), { statusCode: result.response.status === 429 || result.response.status === 413 ? 429 : 502, groqError });
+
+    if ((result.response.status === 429 || result.response.status === 413) && attempt < MAX_RETRIES) {
+      const delay = retryDelayMs(attempt, message);
+      console.warn(`Groq rate limit; retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES}).`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      continue;
+    }
+    break;
   }
 
-  const content = data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error('Groq returned an empty response.');
-
-  let parsed;
-  try { parsed = JSON.parse(content); } catch {
-    throw new Error('AI returned invalid JSON.');
-  }
-
-  const cards = Array.isArray(parsed.cards)
-    ? parsed.cards.map(card => ({ question: String(card?.question || '').trim(), answer: String(card?.answer || '').trim() })).filter(card => card.question && card.answer).slice(0, args.cardCount)
-    : [];
-
-  if (!cards.length) throw new Error('AI did not generate any usable flashcards.');
-  return {
-    title: String(parsed.title || args.chapters || 'AI Generated Flashcards').trim(),
-    subject: String(parsed.subject || 'Electronics Engineering').trim(),
-    description: String(parsed.description || `Flashcards generated from ${args.chapters}.`).trim(),
-    cards
-  };
+  throw lastError || new Error('Unable to generate flashcards.');
 }
 
 async function handleFlashcards(request, env, origin) {
@@ -312,19 +352,20 @@ async function handleFlashcards(request, env, origin) {
     extractedPages: extracted.pages,
     extractedChars: extracted.text.length,
     truncatedPages: extracted.truncatedPages,
-    truncatedText: extracted.truncatedText,
-    detection: extracted.detection
+    truncatedText: extracted.truncatedText
   });
 
   const result = await generateFlashcards(env, { text: extracted.text, chapters, cardCount, difficulty, instructions });
-  return json({ ...result, source: {
-    requestedChapter: extracted.detectedChapter,
-    pdfPages: extracted.totalPdfPages,
-    chapterPages: `${extracted.chapterStartPage}-${extracted.chapterEndPage}`,
-    extractedPages: extracted.pages,
-    truncated: extracted.truncatedPages || extracted.truncatedText,
-    detection: extracted.detection
-  }}, 200, origin);
+  return json({
+    ...result,
+    source: {
+      requestedChapter: extracted.detectedChapter,
+      pdfPages: extracted.totalPdfPages,
+      chapterPages: `${extracted.chapterStartPage}-${extracted.chapterEndPage}`,
+      extractedPages: extracted.pages,
+      truncated: extracted.truncatedPages || extracted.truncatedText
+    }
+  }, 200, origin);
 }
 
 export default {
@@ -336,6 +377,7 @@ export default {
       'access-control-allow-methods': 'GET,POST,OPTIONS',
       'access-control-allow-headers': 'Content-Type, Authorization'
     }});
+
     const url = new URL(request.url);
     try {
       if (url.pathname === '/' || url.pathname === '/health') return json({ ok: true, service: 'ecehub-ai-cloudflare-worker' }, 200, origin);
