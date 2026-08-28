@@ -1,14 +1,39 @@
 import { handleCommunity } from './community.js';
 
+function corsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin'
+  };
+}
+
 function corsOrigin(request, env) {
-  const origin = request.headers.get('Origin');
-  const configured = String(env.FRONTEND_ORIGIN || '')
+  const requestOrigin = request.headers.get('Origin') || '';
+
+  const allowedOrigins = new Set([
+    'https://espaderarios.github.io',
+    'http://127.0.0.1:5500',
+    'http://localhost:5500'
+  ]);
+
+  const configuredOrigins = String(env.FRONTEND_ORIGIN || '')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
 
-  if (!origin || !configured.length) return '*';
-  return configured.includes(origin) ? origin : null;
+  for (const configuredOrigin of configuredOrigins) {
+    allowedOrigins.add(configuredOrigin);
+  }
+
+  if (allowedOrigins.has(requestOrigin)) {
+    return requestOrigin;
+  }
+
+  return null;
 }
 
 function json(data, status = 200, origin = '*', extraHeaders = {}) {
@@ -54,20 +79,41 @@ export default {
   async fetch(request, env) {
     const origin = corsOrigin(request, env);
 
-    if (origin === null) {
-      return json({ error: 'CORS origin not allowed.' }, 403, '*');
-    }
-
     if (request.method === 'OPTIONS') {
+      if (origin === null) {
+        return new Response(
+          JSON.stringify({
+            error: 'CORS origin not allowed.'
+          }),
+          {
+            status: 403,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Vary': 'Origin'
+            }
+          }
+        );
+      }
+
       return new Response(null, {
         status: 204,
-        headers: {
-          'access-control-allow-origin': origin,
-          'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-          'access-control-allow-headers': 'Content-Type, Authorization',
-          'access-control-allow-credentials': 'true'
-        }
+        headers: corsHeaders(origin)
       });
+    }
+
+    if (origin === null) {
+      return new Response(
+        JSON.stringify({
+          error: 'CORS origin not allowed.'
+        }),
+        {
+          status: 403,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Vary': 'Origin'
+          }
+        }
+      );
     }
 
     const url = new URL(request.url);
@@ -81,10 +127,21 @@ export default {
     }
 
     try {
-      const response = await handleCommunity(normalizedRequest(request), env, origin);
-      return response || json({ error: 'Not found.' }, 404, origin);
+      const response = await handleCommunity(
+        normalizedRequest(request),
+        env,
+        origin
+      );
+
+      return response || json(
+        { error: 'Not found.' },
+        404,
+        origin
+      );
+
     } catch (error) {
       console.error('Community worker error:', error);
+
       return json({
         error: error.message || 'Internal server error.'
       }, error.statusCode || 500, origin);

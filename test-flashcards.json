@@ -1,0 +1,16 @@
+{
+  "title": "Digital Electronics Fundamentals",
+  "subject": "Digital Electronics",
+  "description": "Basic digital electronics concepts.",
+  "visibility": "public",
+  "cards": [
+    {
+      "question": "What is a logic gate?",
+      "answer": "A digital circuit that performs a logical operation on one or more binary inputs."
+    },
+    {
+      "question": "What are the two binary logic levels?",
+      "answer": "Logic 0 and Logic 1."
+    }
+  ]
+}
