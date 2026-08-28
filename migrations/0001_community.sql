@@ -47,12 +47,3 @@ CREATE INDEX IF NOT EXISTS idx_flashcard_sets_created ON flashcard_sets(created_
 CREATE INDEX IF NOT EXISTS idx_flashcard_sets_subject ON flashcard_sets(subject);
 CREATE INDEX IF NOT EXISTS idx_flashcards_set_position ON flashcards(set_id, position);
 CREATE INDEX IF NOT EXISTS idx_workspace_sets_user ON workspace_sets(user_id, added_at DESC);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS flashcard_search USING fts5(
-  set_id UNINDEXED,
-  title,
-  subject,
-  description,
-  username,
-  content=''
-);
