@@ -285,7 +285,27 @@ async function ensureUniqueUsername(
   return !result;
 }
 
-function userPublic(user) { return { id: user.id, username: user.username, displayName: user.display_name, avatarUrl: user.avatar_url, bio: user.bio, /* * A user is considered linked only when Google OAuth * has supplied a Google subject identifier. */ googleLinked: Boolean(user.google_sub), googleEmail: user.google_email || '', googleEmailVerified: Boolean(user.google_email_verified), createdAt: user.created_at, updatedAt: user.updated_at }; }
+function userPublic(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.display_name,
+    avatarUrl: user.avatar_url,
+    bio: user.bio,
+
+    googleLinked: Boolean(user.google_sub),
+
+    googleSub: user.google_sub || null,
+
+    googleEmail: user.google_email || '',
+
+    googleEmailVerified:
+      Boolean(user.google_email_verified),
+
+    createdAt: user.created_at,
+    updatedAt: user.updated_at
+  };
+}
 
 function setSessionCookie(token) {
   return [
@@ -309,33 +329,83 @@ function clearCookie(name) {
   ].join('; ');
 }
 
-function setGoogleStateCookie(state) { return `ecehub_google_state=${state}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=None`; }
-function getGoogleStateCookie(request) { return getCookie(request, 'ecehub_google_state'); }
-function clearGoogleStateCookie() { return 'ecehub_google_state=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None'; }
+function setGoogleStateCookie(state) {
+  return [
+    `${GOOGLE_STATE_COOKIE}=${state}`,
+    'Path=/',
+    'Max-Age=600',
+    'HttpOnly',
+    'Secure',
+    'SameSite=None'
+  ].join('; ');
+}
 
-function getGoogleRedirectUri(request, env) { if (env.GOOGLE_REDIRECT_URI) { return env.GOOGLE_REDIRECT_URI; } const url = new URL(request.url); return `${url.origin}/api/auth/google/callback`; }
+function getGoogleStateCookie(request) {
+  return getCookie(request, GOOGLE_STATE_COOKIE);
+}
+
+function clearGoogleStateCookie() {
+  return [
+    `${GOOGLE_STATE_COOKIE}=`,
+    'Path=/',
+    'Max-Age=0',
+    'HttpOnly',
+    'Secure',
+    'SameSite=None'
+  ].join('; ');
+}
+
+function getGoogleRedirectUri(request, env) {
+  if (env.GOOGLE_REDIRECT_URI) {
+    return env.GOOGLE_REDIRECT_URI;
+  }
+
+  const url = new URL(request.url);
+
+  return `${url.origin}/api/auth/google/callback`;
+}
 
 function googleErrorRedirect(request, env, error) {
   const url = new URL(getFrontendOrigin(env, request));
-  url.searchParams.set('community_google_error', error);
-  return Response.redirect(url.toString(), 302);
+
+  url.searchParams.set(
+    'community_google_error',
+    error
+  );
+
+  return Response.redirect(
+    url.toString(),
+    302
+  );
 }
 
 function googleSuccessRedirect(request, env) {
   const url = new URL(getFrontendOrigin(env, request));
-  url.searchParams.set('community_google_linked', '1');
-  return Response.redirect(url.toString(), 302);
+
+  url.searchParams.set(
+    'community_google_linked',
+    '1'
+  );
+
+  return Response.redirect(
+    url.toString(),
+    302
+  );
 }
 
 function getFrontendOrigin(env, request) {
-  const configured = String(env.FRONTEND_ORIGIN || '')
+  const configured = String(
+    env.FRONTEND_ORIGIN || ''
+  )
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
 
-  if (configured.length) return configured[0];
+  if (configured.length) {
+    return configured[0];
+  }
 
-  return new URL(request.url).origin;
+  return 'https://espaderarios.github.io/EcEHub/';
 }
 
 
@@ -380,7 +450,7 @@ async function handleGoogleStart(request, env, db) {
     crypto.getRandomValues(new Uint8Array(32))
   );
 
-  const redirectUri = getGoogleRedirectUri(request);
+  const redirectUri = getGoogleRedirectUri(request, env);
 
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,
@@ -421,7 +491,7 @@ async function handleGoogleCallback(request, env, db) {
     );
   }
 
-  const storedState = getCookie(request, GOOGLE_STATE_COOKIE);
+  const storedState = getGoogleStateCookie(request);
 
   if (!storedState || storedState !== state) {
     return googleErrorRedirect(
@@ -459,7 +529,7 @@ async function handleGoogleCallback(request, env, db) {
   }
 
   try {
-    const redirectUri = getGoogleRedirectUri(request);
+    const redirectUri = getGoogleRedirectUri(request, env);
 
     const tokenResponse = await fetch(GOOGLE_TOKEN_URL, {
       method: 'POST',
@@ -478,12 +548,20 @@ async function handleGoogleCallback(request, env, db) {
     const tokenData = await tokenResponse.json();
 
     if (!tokenResponse.ok || !tokenData.access_token) {
-      console.error('Google token exchange failed:', tokenData);
+      console.error(
+        'Google token exchange failed:',
+        JSON.stringify(tokenData)
+      );
+
+      const googleReason =
+        tokenData.error_description ||
+        tokenData.error ||
+        'unknown_google_token_error';
 
       return googleErrorRedirect(
         request,
         env,
-        'google_token_exchange_failed'
+        `google_token_exchange_failed_${googleReason}`
       );
     }
 
@@ -605,6 +683,79 @@ async function handleGoogleCallback(request, env, db) {
 }
 
 async function handleProfile( request, env, db, origin ) { const user = await requireUser( request, env, db ); if (request.method === 'GET') { return json( { user: userPublic(user) }, 200, origin ); } if (request.method !== 'PATCH') { return errorResponse( 'Method not allowed.', 405, origin ); } let body; try { body = await request.json(); } catch { return errorResponse( 'Request body must be valid JSON.', 400, origin ); } /* * Username is still editable for guest users, * but Google identity fields are NEVER accepted * from this endpoint. */ const username = cleanString( body.username, 24 ); const displayName = cleanString( body.displayName, 80 ); const avatarUrl = cleanString( body.avatarUrl, 500 ); const bio = cleanString( body.bio, 500 ); if ( username && !USERNAME_PATTERN.test(username) ) { return errorResponse( 'Username must be 3-24 characters and contain only letters, numbers, and underscores.', 400, origin ); } if ( username && !(await ensureUniqueUsername( db, username, user.id )) ) { return errorResponse( 'That username is already taken.', 409, origin ); } const nextUsername = username || user.username; const nextDisplayName = body.displayName !== undefined ? displayName : user.display_name; const nextAvatarUrl = body.avatarUrl !== undefined ? avatarUrl : user.avatar_url; const nextBio = body.bio !== undefined ? bio : user.bio; /* * IMPORTANT: * * Do NOT update: * google_sub * google_email * google_email_verified * * Those fields are controlled exclusively * by the Google OAuth flow. */ await db.prepare(` UPDATE users SET username = ?, display_name = ?, avatar_url = ?, bio = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? `).bind( nextUsername, nextDisplayName, nextAvatarUrl, nextBio, user.id ).run(); const updated = await getUserById( db, user.id ); return json( { user: userPublic(updated) }, 200, origin ); }
+
+async function handleGoogleUnlink(request, env, db, origin) {
+  if (request.method !== 'POST') {
+    return errorResponse(
+      'Method not allowed.',
+      405,
+      origin
+    );
+  }
+
+  const userId = await readSession(request, env);
+
+  if (!userId) {
+    return errorResponse(
+      'Authentication required.',
+      401,
+      origin
+    );
+  }
+
+  const user = await db.prepare(`
+    SELECT
+      id,
+      google_sub,
+      google_email
+    FROM users
+    WHERE id = ?
+  `)
+    .bind(userId)
+    .first();
+
+  if (!user) {
+    return errorResponse(
+      'User session no longer exists.',
+      401,
+      origin
+    );
+  }
+
+  if (!user.google_sub) {
+    return errorResponse(
+      'No Google account is linked.',
+      409,
+      origin
+    );
+  }
+
+  await db.prepare(`
+    UPDATE users
+    SET
+      google_sub = NULL,
+      google_email = NULL,
+      google_email_verified = 0,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `)
+    .bind(userId)
+    .run();
+
+  const updatedUser = await getUserById(
+    db,
+    userId
+  );
+
+  return json(
+    {
+      ok: true,
+      user: userPublic(updatedUser)
+    },
+    200,
+    origin
+  );
+}
 
 async function handleUsernameAvailability(
   request,
@@ -1566,7 +1717,11 @@ export async function handleCommunity(request, env, origin) {
 
   if (url.pathname === '/api/auth/session') {
     if (request.method !== 'POST') {
-      return errorResponse('Method not allowed.', 405, origin);
+      return errorResponse(
+        'Method not allowed.',
+        405,
+        origin
+      );
     }
 
     return createAnonymousSession(
@@ -1576,13 +1731,38 @@ export async function handleCommunity(request, env, origin) {
       origin
     );
   }
+  
+  if (url.pathname === '/api/auth/google/unlink') {
+    return handleGoogleUnlink(
+      request,
+      env,
+      db,
+      origin
+    );
+  }
 
-  if (url.pathname === '/api/auth/google') {
-    return handleGoogleStart(request, env, db);
+  if (url.pathname === '/api/auth/google/start') {
+    if (request.method !== 'GET') {
+      return errorResponse(
+        'Method not allowed.',
+        405,
+        origin
+      );
+    }
+
+    return handleGoogleStart(
+      request,
+      env,
+      db
+    );
   }
 
   if (url.pathname === '/api/auth/google/callback') {
-    return handleGoogleCallback(request, env, db);
+    return handleGoogleCallback(
+      request,
+      env,
+      db
+    );
   }
 
   if (url.pathname === '/api/users/me') {

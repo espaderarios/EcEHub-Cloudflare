@@ -14,6 +14,12 @@ function corsHeaders(origin) {
 function corsOrigin(request, env) {
   const requestOrigin = request.headers.get('Origin') || '';
 
+  // Direct browser navigation, OAuth redirects, curl, etc.
+  // do not necessarily send an Origin header.
+  if (!requestOrigin) {
+    return '';
+  }
+
   const allowedOrigins = new Set([
     'https://espaderarios.github.io',
     'http://127.0.0.1:5500',
@@ -80,7 +86,7 @@ export default {
     const origin = corsOrigin(request, env);
 
     if (request.method === 'OPTIONS') {
-      if (origin === null) {
+      if (origin === null || !origin) {
         return new Response(
           JSON.stringify({
             error: 'CORS origin not allowed.'
@@ -101,6 +107,8 @@ export default {
       });
     }
 
+    // Only reject requests that actually supplied an
+    // Origin header and that origin is not allowed.
     if (origin === null) {
       return new Response(
         JSON.stringify({
@@ -123,20 +131,20 @@ export default {
         ok: true,
         service: 'ecehub-community-cloudflare-worker',
         database: Boolean(env.DB)
-      }, 200, origin);
+      }, 200, origin || null);
     }
 
     try {
       const response = await handleCommunity(
         normalizedRequest(request),
         env,
-        origin
+        origin || null
       );
 
       return response || json(
         { error: 'Not found.' },
         404,
-        origin
+        origin || null
       );
 
     } catch (error) {
@@ -144,7 +152,7 @@ export default {
 
       return json({
         error: error.message || 'Internal server error.'
-      }, error.statusCode || 500, origin);
+      }, error.statusCode || 500, origin || null);
     }
   }
 };
