@@ -1,7 +1,8 @@
-import { extractText, getDocumentProxy } from 'unpdf';
+import { getDocumentProxy } from 'unpdf';
 
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
-const MAX_PAGES = 250;
+const MAX_SCAN_PAGES = 1500;
+const MAX_CHAPTER_PAGES = 80;
 const MAX_SOURCE_CHARS = 18000;
 const MAX_INSTRUCTIONS_CHARS = 800;
 const MAX_CHAPTER_QUERY_CHARS = 120;
@@ -130,78 +131,104 @@ function normalizePageText(text) {
     .trim();
 }
 
-function chapterNumberFromHeading(text) {
-  const firstLines = normalizePageText(text)
-    .split('\n')
-    .slice(0, 12)
-    .join('\n');
-
-  let match = firstLines.match(/^\s*chapter\s+(\d{1,3})\b/im);
-  if (match) return Number(match[1]);
-
-  match = firstLines.match(/^\s*chapter\s+([ivxlcdm]+)\b/im);
-  if (match) {
-    const roman = match[1].toUpperCase();
-    const values = { I: 1, V: 5, X: 10, L: 50, C: 100 };
-    let total = 0;
-    for (let i = 0; i < roman.length; i++) {
-      const current = values[roman[i]] || 0;
-      const next = values[roman[i + 1]] || 0;
-      total += current < next ? -current : current;
-    }
-    return total;
-  }
-
-  return null;
-}
-
 function parseRequestedChapter(chapters) {
   const value = String(chapters).trim();
   const match = value.match(/(?:chapter\s*)?(\d{1,3})/i);
   return match ? Number(match[1]) : null;
 }
 
-async function extractChapterText(pdfBytes, chapterQuery) {
-  const pdf = await getDocumentProxy(pdfBytes);
+function parseChapterHeading(text) {
+  const normalized = normalizePageText(text);
+  const firstLines = normalized
+    .split('\n')
+    .slice(0, 18)
+    .join('\n');
 
-  if (pdf.numPages > MAX_PAGES) {
-    throw Object.assign(
-      new Error(`PDF has ${pdf.numPages} pages. Maximum supported is ${MAX_PAGES} pages.`),
-      { statusCode: 413 }
-    );
+  let match = firstLines.match(/(?:^|\n)\s*chapter\s+(\d{1,3})\b/i);
+  if (match) return Number(match[1]);
+
+  match = firstLines.match(/(?:^|\n)\s*chapter\s+([ivxlcdm]+)\b/i);
+  if (!match) return null;
+
+  const roman = match[1].toUpperCase();
+  const values = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+  let total = 0;
+
+  for (let i = 0; i < roman.length; i++) {
+    const current = values[roman[i]] || 0;
+    const next = values[roman[i + 1]] || 0;
+    total += current < next ? -current : current;
   }
 
-  const { text } = await extractText(pdf, { mergePages: false });
-  const pages = Array.isArray(text) ? text.map(normalizePageText) : [];
-  const requestedNumber = parseRequestedChapter(chapterQuery);
+  return total;
+}
 
+async function getPageText(pdf, pageNumber) {
+  const page = await pdf.getPage(pageNumber);
+  const content = await page.getTextContent();
+
+  return normalizePageText(
+    content.items
+      .map(item => item?.str || '')
+      .join(' ')
+  );
+}
+
+async function locateChapterPages(pdf, requestedChapter) {
+  const pageCount = pdf.numPages;
+  const scanLimit = Math.min(pageCount, MAX_SCAN_PAGES);
   const chapterStarts = [];
-  pages.forEach((page, index) => {
-    const number = chapterNumberFromHeading(page);
-    if (number !== null) chapterStarts.push({ number, index });
-  });
 
-  let selected = [];
+  // IMPORTANT: We do NOT extract the whole PDF here.
+  // Only lightweight text from each page is inspected until the requested
+  // chapter is found. The full text is extracted only from that chapter.
+  for (let pageNumber = 1; pageNumber <= scanLimit; pageNumber++) {
+    const pageText = await getPageText(pdf, pageNumber);
+    const chapterNumber = parseChapterHeading(pageText);
 
-  if (requestedNumber !== null) {
-    const start = chapterStarts.find(x => x.number === requestedNumber);
+    if (chapterNumber !== null) {
+      chapterStarts.push({ number: chapterNumber, page: pageNumber });
 
-    if (start) {
-      const next = chapterStarts.find(x => x.index > start.index);
-      const endIndex = next ? next.index : pages.length;
-      selected = pages.slice(start.index, endIndex);
+      if (chapterNumber === requestedChapter) {
+        break;
+      }
     }
   }
 
-  // Fallback: if the PDF's chapter headings are unusual, use the first pages
-  // instead of sending the entire book to the model.
-  if (!selected.length) {
-    selected = pages.slice(0, Math.min(12, pages.length));
+  const start = chapterStarts.find(x => x.number === requestedChapter);
+  if (!start) return null;
+
+  // Find the next chapter after the requested one. We only scan further pages
+  // until the next chapter heading appears.
+  let endPage = pageCount;
+
+  for (let pageNumber = start.page + 1; pageNumber <= scanLimit; pageNumber++) {
+    const pageText = await getPageText(pdf, pageNumber);
+    const chapterNumber = parseChapterHeading(pageText);
+
+    if (chapterNumber !== null && chapterNumber !== requestedChapter) {
+      endPage = pageNumber - 1;
+      break;
+    }
   }
 
-  let combined = selected
-    .map((page, index) => `[Page ${index + 1}]\n${page}`)
-    .join('\n\n');
+  return {
+    startPage: start.page,
+    endPage,
+    pageCount: endPage - start.page + 1
+  };
+}
+
+async function extractSelectedPages(pdf, startPage, endPage) {
+  const actualEnd = Math.min(endPage, startPage + MAX_CHAPTER_PAGES - 1);
+  const pages = [];
+
+  for (let pageNumber = startPage; pageNumber <= actualEnd; pageNumber++) {
+    const text = await getPageText(pdf, pageNumber);
+    if (text) pages.push(`[PDF page ${pageNumber}]\n${text}`);
+  }
+
+  let combined = pages.join('\n\n');
 
   if (combined.length > MAX_SOURCE_CHARS) {
     combined = combined.slice(0, MAX_SOURCE_CHARS) +
@@ -210,13 +237,50 @@ async function extractChapterText(pdfBytes, chapterQuery) {
 
   return {
     text: combined,
-    pages: selected.length,
-    detectedChapter: requestedNumber
+    pages: pages.length,
+    startPage,
+    endPage: actualEnd,
+    truncatedPages: endPage > actualEnd
+  };
+}
+
+async function extractChapterText(pdfBytes, chapterQuery) {
+  const pdf = await getDocumentProxy(pdfBytes);
+  const requestedNumber = parseRequestedChapter(chapterQuery);
+
+  if (requestedNumber === null) {
+    throw Object.assign(
+      new Error('Please specify a chapter number, for example "Chapter 1".'),
+      { statusCode: 400 }
+    );
+  }
+
+  const location = await locateChapterPages(pdf, requestedNumber);
+
+  if (!location) {
+    throw Object.assign(
+      new Error(`Could not locate Chapter ${requestedNumber} in this PDF.`),
+      { statusCode: 422 }
+    );
+  }
+
+  const extracted = await extractSelectedPages(
+    pdf,
+    location.startPage,
+    location.endPage
+  );
+
+  return {
+    ...extracted,
+    detectedChapter: requestedNumber,
+    totalPdfPages: pdf.numPages,
+    chapterStartPage: location.startPage,
+    chapterEndPage: location.endPage
   };
 }
 
 function buildPrompt({ text, chapters, cardCount, difficulty, instructions }) {
-  return `You are EcE Hub's flashcard specialist. Create high-quality study flashcards ONLY from the supplied textbook excerpt.
+  return `You are EcE Hub's flashcard specialist. Create high-quality study flashcards ONLY from the supplied textbook chapter excerpt.
 
 Requested chapter: ${chapters}
 Difficulty: ${difficulty}
@@ -279,7 +343,10 @@ async function generateFlashcards(env, args) {
 
   if (!response.ok) {
     const message = data?.error?.message || `Groq returned HTTP ${response.status}.`;
-    throw Object.assign(new Error(message), { statusCode: response.status === 429 || response.status === 413 ? 429 : 502 });
+    throw Object.assign(
+      new Error(message),
+      { statusCode: response.status === 429 || response.status === 413 ? 429 : 502 }
+    );
   }
 
   const content = data?.choices?.[0]?.message?.content;
@@ -346,10 +413,14 @@ async function handleFlashcards(request, env, origin) {
     return errorResponse('No extractable text was found in the requested chapter.', 422, origin);
   }
 
-  console.log('Chapter extraction', {
-    pages: extracted.pages,
-    chars: extracted.text.length,
-    requestedChapter: extracted.detectedChapter
+  console.log('Chapter-specific extraction', {
+    requestedChapter: extracted.detectedChapter,
+    totalPdfPages: extracted.totalPdfPages,
+    chapterStartPage: extracted.chapterStartPage,
+    chapterEndPage: extracted.chapterEndPage,
+    extractedPages: extracted.pages,
+    extractedChars: extracted.text.length,
+    truncatedPages: extracted.truncatedPages
   });
 
   const result = await generateFlashcards(env, {
@@ -360,7 +431,16 @@ async function handleFlashcards(request, env, origin) {
     instructions
   });
 
-  return json(result, 200, origin);
+  return json({
+    ...result,
+    source: {
+      requestedChapter: extracted.detectedChapter,
+      pdfPages: extracted.totalPdfPages,
+      chapterPages: `${extracted.chapterStartPage}-${extracted.chapterEndPage}`,
+      extractedPages: extracted.pages,
+      truncated: extracted.truncatedPages || extracted.text.includes('[Chapter text truncated')
+    }
+  }, 200, origin);
 }
 
 export default {
@@ -396,7 +476,11 @@ export default {
       return errorResponse('Not found.', 404, origin);
     } catch (error) {
       console.error('Worker error:', error);
-      return errorResponse(error.message || 'Internal server error.', error.statusCode || 500, origin);
+      return errorResponse(
+        error.message || 'Internal server error.',
+        error.statusCode || 500,
+        origin
+      );
     }
   }
 };
