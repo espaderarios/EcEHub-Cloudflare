@@ -25,6 +25,31 @@ function json(data, status = 200, origin = '*', extraHeaders = {}) {
   });
 }
 
+// community.js uses a two-level path internally for item routes and a one-level
+// path for collection routes. Keep the public API clean while adapting the
+// incoming URL before handing it to the router.
+function normalizedRequest(request) {
+  const url = new URL(request.url);
+
+  for (const resource of ['flashcards', 'workspace']) {
+    const prefix = `/api/${resource}`;
+    if (url.pathname === prefix) {
+      url.pathname = `${prefix}/__collection__`;
+      return new Request(url, request);
+    }
+
+    if (url.pathname.startsWith(`${prefix}/`)) {
+      const rest = url.pathname.slice(`${prefix}/`.length);
+      if (rest && !rest.includes('/')) {
+        url.pathname = `${prefix}/__item__/${rest}`;
+        return new Request(url, request);
+      }
+    }
+  }
+
+  return request;
+}
+
 export default {
   async fetch(request, env) {
     const origin = corsOrigin(request, env);
@@ -56,7 +81,7 @@ export default {
     }
 
     try {
-      const response = await handleCommunity(request, env, origin);
+      const response = await handleCommunity(normalizedRequest(request), env, origin);
       return response || json({ error: 'Not found.' }, 404, origin);
     } catch (error) {
       console.error('Community worker error:', error);
