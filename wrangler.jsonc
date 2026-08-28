@@ -1,10 +1,18 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ecehub-ai-backend",
-  "main": "src/index.js",
+  "name": "ecehub-community",
+  "main": "src/community-worker.js",
   "compatibility_date": "2026-08-28",
   "workers_dev": true,
   "observability": {
     "enabled": true
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ecehub-community",
+      "database_id": "dae3115d-471e-4137-8b47-ebf5bd283585",
+      "migrations_dir": "migrations"
+    }
+  ]
 }

@@ -11,8 +11,9 @@
     {
       "binding": "DB",
       "database_name": "ecehub-community",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "dae3115d-471e-4137-8b47-ebf5bd283585",
       "migrations_dir": "migrations"
     }
   ]
 }
+
