@@ -1,7 +1,7 @@
 import { getDocumentProxy } from 'unpdf';
 
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
-const MAX_SCAN_PAGES = 1500;
+const MAX_AUTO_SCAN_PAGES = 120;
 const MAX_CHAPTER_PAGES = 80;
 const MAX_SOURCE_CHARS = 18000;
 const MAX_INSTRUCTIONS_CHARS = 800;
@@ -34,8 +34,8 @@ function corsOrigin(request, env) {
   return configured.includes(origin) ? origin : null;
 }
 
-function errorResponse(message, status = 500, origin = '*') {
-  return json({ error: message }, status, origin);
+function errorResponse(message, status = 500, origin = '*', extra = {}) {
+  return json({ error: message, ...extra }, status, origin);
 }
 
 function extractDriveFileId(inputUrl) {
@@ -48,9 +48,9 @@ function extractDriveFileId(inputUrl) {
 
   const allowedHosts = new Set([
     'drive.google.com',
+    'www.drive.google.com',
     'docs.google.com',
-    'drive.usercontent.google.com',
-    'www.drive.google.com'
+    'drive.usercontent.google.com'
   ]);
 
   if (!allowedHosts.has(url.hostname)) {
@@ -94,16 +94,18 @@ async function downloadGoogleDrivePdf(inputUrl) {
 
       const length = Number(response.headers.get('content-length') || 0);
       if (length > MAX_PDF_BYTES) {
-        throw Object.assign(new Error('PDF is too large. Maximum allowed size is 50 MB.'), {
-          statusCode: 413
-        });
+        throw Object.assign(
+          new Error('PDF is too large. Maximum allowed size is 50 MB.'),
+          { statusCode: 413 }
+        );
       }
 
       const buffer = await response.arrayBuffer();
       if (buffer.byteLength > MAX_PDF_BYTES) {
-        throw Object.assign(new Error('PDF is too large. Maximum allowed size is 50 MB.'), {
-          statusCode: 413
-        });
+        throw Object.assign(
+          new Error('PDF is too large. Maximum allowed size is 50 MB.'),
+          { statusCode: 413 }
+        );
       }
 
       const header = new TextDecoder().decode(buffer.slice(0, 5));
@@ -139,10 +141,7 @@ function parseRequestedChapter(chapters) {
 
 function parseChapterHeading(text) {
   const normalized = normalizePageText(text);
-  const firstLines = normalized
-    .split('\n')
-    .slice(0, 18)
-    .join('\n');
+  const firstLines = normalized.split('\n').slice(0, 18).join('\n');
 
   let match = firstLines.match(/(?:^|\n)\s*chapter\s+(\d{1,3})\b/i);
   if (match) return Number(match[1]);
@@ -163,6 +162,44 @@ function parseChapterHeading(text) {
   return total;
 }
 
+function parsePageRange(value) {
+  if (value === undefined || value === null || value === '') return null;
+
+  if (typeof value === 'object' && value !== null) {
+    const start = Number(value.start ?? value.startPage ?? value.from);
+    const end = Number(value.end ?? value.endPage ?? value.to);
+
+    if (Number.isInteger(start) && Number.isInteger(end) && start >= 1 && end >= start) {
+      return { startPage: start, endPage: end };
+    }
+
+    return null;
+  }
+
+  const match = String(value).trim().match(/^(\d+)\s*(?:-|–|—|to)\s*(\d+)$/i);
+  if (!match) return null;
+
+  const startPage = Number(match[1]);
+  const endPage = Number(match[2]);
+
+  if (!Number.isInteger(startPage) || !Number.isInteger(endPage) || startPage < 1 || endPage < startPage) {
+    return null;
+  }
+
+  return { startPage, endPage };
+}
+
+function parseExplicitPageRange(body) {
+  return (
+    parsePageRange(body.chapterPages) ||
+    parsePageRange(body.pageRange) ||
+    parsePageRange({
+      start: body.chapterStartPage,
+      end: body.chapterEndPage
+    })
+  );
+}
+
 async function getPageText(pdf, pageNumber) {
   const page = await pdf.getPage(pageNumber);
   const content = await page.getTextContent();
@@ -176,51 +213,56 @@ async function getPageText(pdf, pageNumber) {
 
 async function locateChapterPages(pdf, requestedChapter) {
   const pageCount = pdf.numPages;
-  const scanLimit = Math.min(pageCount, MAX_SCAN_PAGES);
-  const chapterStarts = [];
+  const scanLimit = Math.min(pageCount, MAX_AUTO_SCAN_PAGES);
 
-  // IMPORTANT: We do NOT extract the whole PDF here.
-  // Only lightweight text from each page is inspected until the requested
-  // chapter is found. The full text is extracted only from that chapter.
   for (let pageNumber = 1; pageNumber <= scanLimit; pageNumber++) {
     const pageText = await getPageText(pdf, pageNumber);
     const chapterNumber = parseChapterHeading(pageText);
 
-    if (chapterNumber !== null) {
-      chapterStarts.push({ number: chapterNumber, page: pageNumber });
+    if (chapterNumber === requestedChapter) {
+      let endPage = Math.min(pageCount, pageNumber + MAX_CHAPTER_PAGES - 1);
 
-      if (chapterNumber === requestedChapter) {
-        break;
+      // Search only within the maximum chapter extraction window. This avoids
+      // walking hundreds of pages after the requested chapter is found.
+      for (let nextPage = pageNumber + 1; nextPage <= endPage; nextPage++) {
+        const nextText = await getPageText(pdf, nextPage);
+        const nextChapter = parseChapterHeading(nextText);
+
+        if (nextChapter !== null && nextChapter !== requestedChapter) {
+          endPage = nextPage - 1;
+          break;
+        }
       }
+
+      return {
+        startPage: pageNumber,
+        endPage,
+        pageCount: endPage - pageNumber + 1,
+        detection: 'automatic'
+      };
     }
   }
 
-  const start = chapterStarts.find(x => x.number === requestedChapter);
-  if (!start) return null;
-
-  // Find the next chapter after the requested one. We only scan further pages
-  // until the next chapter heading appears.
-  let endPage = pageCount;
-
-  for (let pageNumber = start.page + 1; pageNumber <= scanLimit; pageNumber++) {
-    const pageText = await getPageText(pdf, pageNumber);
-    const chapterNumber = parseChapterHeading(pageText);
-
-    if (chapterNumber !== null && chapterNumber !== requestedChapter) {
-      endPage = pageNumber - 1;
-      break;
-    }
-  }
-
-  return {
-    startPage: start.page,
-    endPage,
-    pageCount: endPage - start.page + 1
-  };
+  return null;
 }
 
 async function extractSelectedPages(pdf, startPage, endPage) {
-  const actualEnd = Math.min(endPage, startPage + MAX_CHAPTER_PAGES - 1);
+  const pageCount = pdf.numPages;
+
+  if (startPage < 1 || startPage > pageCount) {
+    throw Object.assign(
+      new Error(`Chapter start page ${startPage} is outside the PDF (1-${pageCount}).`),
+      { statusCode: 400 }
+    );
+  }
+
+  if (endPage < startPage) {
+    throw Object.assign(new Error('Chapter end page must be greater than or equal to the start page.'), {
+      statusCode: 400
+    });
+  }
+
+  const actualEnd = Math.min(endPage, startPage + MAX_CHAPTER_PAGES - 1, pageCount);
   const pages = [];
 
   for (let pageNumber = startPage; pageNumber <= actualEnd; pageNumber++) {
@@ -229,10 +271,12 @@ async function extractSelectedPages(pdf, startPage, endPage) {
   }
 
   let combined = pages.join('\n\n');
+  let truncatedText = false;
 
   if (combined.length > MAX_SOURCE_CHARS) {
     combined = combined.slice(0, MAX_SOURCE_CHARS) +
       '\n\n[Chapter text truncated by the AI backend.]';
+    truncatedText = true;
   }
 
   return {
@@ -240,11 +284,12 @@ async function extractSelectedPages(pdf, startPage, endPage) {
     pages: pages.length,
     startPage,
     endPage: actualEnd,
-    truncatedPages: endPage > actualEnd
+    truncatedPages: endPage > actualEnd,
+    truncatedText
   };
 }
 
-async function extractChapterText(pdfBytes, chapterQuery) {
+async function extractChapterText(pdfBytes, chapterQuery, explicitRange = null) {
   const pdf = await getDocumentProxy(pdfBytes);
   const requestedNumber = parseRequestedChapter(chapterQuery);
 
@@ -255,11 +300,29 @@ async function extractChapterText(pdfBytes, chapterQuery) {
     );
   }
 
-  const location = await locateChapterPages(pdf, requestedNumber);
+  let location;
+
+  if (explicitRange) {
+    if (explicitRange.startPage > pdf.numPages || explicitRange.endPage > pdf.numPages) {
+      throw Object.assign(
+        new Error(`The requested chapter pages ${explicitRange.startPage}-${explicitRange.endPage} exceed this PDF's ${pdf.numPages} pages.`),
+        { statusCode: 400 }
+      );
+    }
+
+    location = {
+      ...explicitRange,
+      detection: 'explicit'
+    };
+  } else {
+    location = await locateChapterPages(pdf, requestedNumber);
+  }
 
   if (!location) {
     throw Object.assign(
-      new Error(`Could not locate Chapter ${requestedNumber} in this PDF.`),
+      new Error(
+        `Could not automatically locate Chapter ${requestedNumber} within the first ${MAX_AUTO_SCAN_PAGES} PDF pages. Provide chapterStartPage/chapterEndPage (or chapterPages: "start-end") so the Worker can extract the chapter directly without scanning the entire textbook.`
+      ),
       { statusCode: 422 }
     );
   }
@@ -275,7 +338,8 @@ async function extractChapterText(pdfBytes, chapterQuery) {
     detectedChapter: requestedNumber,
     totalPdfPages: pdf.numPages,
     chapterStartPage: location.startPage,
-    chapterEndPage: location.endPage
+    chapterEndPage: location.endPage,
+    detection: location.detection
   };
 }
 
@@ -394,6 +458,7 @@ async function handleFlashcards(request, env, origin) {
   const instructions = String(body.instructions || '').trim().slice(0, MAX_INSTRUCTIONS_CHARS);
   const cardCount = Number(body.cardCount || 20);
   const difficulty = String(body.difficulty || 'medium').toLowerCase();
+  const explicitPageRange = parseExplicitPageRange(body);
 
   if (!driveUrl) return errorResponse('driveUrl is required.', 400, origin);
   if (!chapters) return errorResponse('chapters is required.', 400, origin);
@@ -404,13 +469,30 @@ async function handleFlashcards(request, env, origin) {
     return errorResponse('difficulty must be easy, medium, or hard.', 400, origin);
   }
 
-  console.log('AI flashcard request', { chapters, cardCount, difficulty });
+  const hasPartialPageInput =
+    body.chapterStartPage !== undefined ||
+    body.chapterEndPage !== undefined;
+
+  if (hasPartialPageInput && !explicitPageRange) {
+    return errorResponse(
+      'Both chapterStartPage and chapterEndPage must be valid page numbers, or provide chapterPages as "start-end".',
+      400,
+      origin
+    );
+  }
+
+  console.log('AI flashcard request', {
+    chapters,
+    cardCount,
+    difficulty,
+    explicitPageRange
+  });
 
   const pdfBytes = await downloadGoogleDrivePdf(driveUrl);
-  const extracted = await extractChapterText(pdfBytes, chapters);
+  const extracted = await extractChapterText(pdfBytes, chapters, explicitPageRange);
 
   if (!extracted.text.trim()) {
-    return errorResponse('No extractable text was found in the requested chapter.', 422, origin);
+    return errorResponse('No extractable text was found in the requested chapter pages.', 422, origin);
   }
 
   console.log('Chapter-specific extraction', {
@@ -420,7 +502,9 @@ async function handleFlashcards(request, env, origin) {
     chapterEndPage: extracted.chapterEndPage,
     extractedPages: extracted.pages,
     extractedChars: extracted.text.length,
-    truncatedPages: extracted.truncatedPages
+    truncatedPages: extracted.truncatedPages,
+    truncatedText: extracted.truncatedText,
+    detection: extracted.detection
   });
 
   const result = await generateFlashcards(env, {
@@ -438,7 +522,8 @@ async function handleFlashcards(request, env, origin) {
       pdfPages: extracted.totalPdfPages,
       chapterPages: `${extracted.chapterStartPage}-${extracted.chapterEndPage}`,
       extractedPages: extracted.pages,
-      truncated: extracted.truncatedPages || extracted.text.includes('[Chapter text truncated')
+      truncated: extracted.truncatedPages || extracted.truncatedText,
+      detection: extracted.detection
     }
   }, 200, origin);
 }
@@ -466,7 +551,15 @@ export default {
 
     try {
       if (url.pathname === '/' || url.pathname === '/health') {
-        return json({ ok: true, service: 'ecehub-ai-cloudflare-worker' }, 200, origin);
+        return json({
+          ok: true,
+          service: 'ecehub-ai-cloudflare-worker',
+          chapterExtraction: {
+            automaticScanLimit: MAX_AUTO_SCAN_PAGES,
+            maxChapterPages: MAX_CHAPTER_PAGES,
+            maxSourceChars: MAX_SOURCE_CHARS
+          }
+        }, 200, origin);
       }
 
       if (url.pathname === '/api/ai/flashcards/generate') {
