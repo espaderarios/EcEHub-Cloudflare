@@ -129,6 +129,37 @@ async function verifySessionToken(token, secret) {
   }
 }
 
+async function createSessionToken(userId, secret) {
+  const payload = bytesToBase64Url(
+    new TextEncoder().encode(
+      JSON.stringify({
+        sub: userId,
+        iat: Date.now()
+      })
+    )
+  );
+
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const signature = bytesToBase64Url(
+    new Uint8Array(
+      await crypto.subtle.sign(
+        'HMAC',
+        key,
+        new TextEncoder().encode(payload)
+      )
+    )
+  );
+
+  return `${payload}.${signature}`;
+}
+
 function clearGoogleStateCookie() {
   return [
     'ecehub_google_state=',
@@ -170,6 +201,54 @@ function googleRedirect(env, query = {}) {
   }
 
   return url.toString();
+}
+
+async function mergeGuestIntoGoogleUser(db, guestUserId, googleUserId) {
+  if (!guestUserId || !googleUserId) {
+    throw new Error('Missing user IDs for account merge.');
+  }
+
+  if (guestUserId === googleUserId) {
+    return;
+  }
+
+  await db.prepare(`
+    UPDATE flashcard_sets
+    SET
+      author_id = ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE author_id = ?
+  `).bind(
+    googleUserId,
+    guestUserId
+  ).run();
+
+  await db.prepare(`
+    DELETE FROM workspace_sets
+    WHERE user_id = ?
+      AND flashcard_set_id IN (
+        SELECT flashcard_set_id
+        FROM workspace_sets
+        WHERE user_id = ?
+      )
+  `).bind(
+    guestUserId,
+    googleUserId
+  ).run();
+
+  await db.prepare(`
+    UPDATE workspace_sets
+    SET user_id = ?
+    WHERE user_id = ?
+  `).bind(
+    googleUserId,
+    guestUserId
+  ).run();
+
+  await db.prepare(`
+    DELETE FROM users
+    WHERE id = ?
+  `).bind(guestUserId).run();
 }
 
 async function handleGoogleCallbackDirect(request, env) {
@@ -342,15 +421,42 @@ async function handleGoogleCallbackDirect(request, env) {
     `).bind(googleSub).first();
 
     if (existingGoogleUser && existingGoogleUser.id !== userId) {
-      return new Response(null, {
+      console.log('Google account already linked; merging guest account.', {
+        guestUserId: userId,
+        googleUserId: existingGoogleUser.id
+      });
+
+      await mergeGuestIntoGoogleUser(
+        db,
+        userId,
+        existingGoogleUser.id
+      );
+
+      const mergedToken = await createSessionToken(
+        existingGoogleUser.id,
+        env.SESSION_SECRET
+      );
+
+      const redirect = new URL(googleRedirect(env));
+      redirect.searchParams.set('community_google_linked', '1');
+
+      const response = new Response(null, {
         status: 302,
         headers: {
-          Location: googleRedirect(env, {
-            community_google_error: 'google_account_already_linked'
-          }),
-          'Set-Cookie': clearGoogleStateCookie()
+          Location: redirect.toString()
         }
       });
+
+      response.headers.append(
+        'Set-Cookie',
+        setSessionCookie(mergedToken)
+      );
+      response.headers.append(
+        'Set-Cookie',
+        clearGoogleStateCookie()
+      );
+
+      return response;
     }
 
     const existingEmailUser = await db.prepare(`
@@ -415,18 +521,31 @@ async function handleGoogleCallbackDirect(request, env) {
       throw new Error('Google link database update verification failed.');
     }
 
-    return new Response(null, {
+    const token = await createSessionToken(
+      userId,
+      env.SESSION_SECRET
+    );
+
+    const redirect = new URL(googleRedirect(env));
+    redirect.searchParams.set('community_google_linked', '1');
+
+    const response = new Response(null, {
       status: 302,
       headers: {
-        Location: googleRedirect(env, {
-          community_google_linked: '1'
-        }),
-        'Set-Cookie': [
-          setSessionCookie(sessionToken),
-          clearGoogleStateCookie()
-        ]
+        Location: redirect.toString()
       }
     });
+
+    response.headers.append(
+      'Set-Cookie',
+      setSessionCookie(token)
+    );
+    response.headers.append(
+      'Set-Cookie',
+      clearGoogleStateCookie()
+    );
+
+    return response;
 
   } catch (error) {
     console.error('Direct Google linking failed:', error);
@@ -512,12 +631,6 @@ export default {
       }, 200, origin || null);
     }
 
-    /*
-     * Handle Google OAuth callback here, before community.js.
-     * This guarantees the callback updates D1 and refreshes the
-     * existing EcE Hub session instead of depending on the old
-     * community.js callback implementation.
-     */
     if (url.pathname === '/api/auth/google/callback') {
       return handleGoogleCallbackDirect(request, env);
     }
