@@ -1,0 +1,16 @@
+
+{
+  "title": "Production Test Set",
+  "subject": "Digital Electronics",
+  "description": "Testing production CRUD.",
+  "cards": [
+    {
+      "question": "What is a digital signal?",
+      "answer": "A signal represented using discrete values, typically binary 0 and 1."
+    },
+    {
+      "question": "What are the two basic binary states?",
+      "answer": "0 and 1."
+    }
+  ]
+}

@@ -380,17 +380,22 @@ function googleErrorRedirect(request, env, error) {
 }
 
 function googleSuccessRedirect(request, env) {
-  const url = new URL(getFrontendOrigin(env, request));
+  const url = new URL(
+    getFrontendOrigin(env, request)
+  );
 
   url.searchParams.set(
     'community_google_linked',
     '1'
   );
 
-  return Response.redirect(
-    url.toString(),
-    302
-  );
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: url.toString(),
+      'Set-Cookie': clearGoogleStateCookie()
+    }
+  });
 }
 
 function getFrontendOrigin(env, request) {
@@ -471,6 +476,77 @@ async function handleGoogleStart(request, env, db) {
   });
 }
 
+async function mergeGuestIntoGoogleUser(db, guestUserId, googleUserId) {
+  if (!guestUserId || !googleUserId) {
+    throw new Error('Missing user IDs for account merge.');
+  }
+
+  if (guestUserId === googleUserId) {
+    return;
+  }
+
+  /*
+   * Move flashcard sets owned by the guest account
+   * to the existing Google account.
+   */
+  await db.prepare(`
+    UPDATE flashcard_sets
+    SET
+      author_id = ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE author_id = ?
+  `).bind(
+    googleUserId,
+    guestUserId
+  ).run();
+
+  /*
+   * workspace_sets has:
+   *
+   * PRIMARY KEY (user_id, flashcard_set_id)
+   *
+   * Remove entries that already exist for the Google account
+   * before moving the guest's remaining entries.
+   */
+  await db.prepare(`
+    DELETE FROM workspace_sets
+    WHERE user_id = ?
+      AND flashcard_set_id IN (
+        SELECT flashcard_set_id
+        FROM workspace_sets
+        WHERE user_id = ?
+      )
+  `).bind(
+    guestUserId,
+    googleUserId
+  ).run();
+
+  /*
+   * Move the remaining workspace entries.
+   */
+  await db.prepare(`
+    UPDATE workspace_sets
+    SET user_id = ?
+    WHERE user_id = ?
+  `).bind(
+    googleUserId,
+    guestUserId
+  ).run();
+
+  /*
+   * flashcards don't reference users directly.
+   * They reference flashcard_sets, which we already moved.
+   */
+
+  /*
+   * Finally remove the old guest account.
+   */
+  await db.prepare(`
+    DELETE FROM users
+    WHERE id = ?
+  `).bind(guestUserId).run();
+}
+
 async function handleGoogleCallback(request, env, db) {
   const url = new URL(request.url);
 
@@ -531,6 +607,7 @@ async function handleGoogleCallback(request, env, db) {
   try {
     const redirectUri = getGoogleRedirectUri(request, env);
 
+    // Exchange Google authorization code for tokens
     const tokenResponse = await fetch(GOOGLE_TOKEN_URL, {
       method: 'POST',
       headers: {
@@ -565,6 +642,7 @@ async function handleGoogleCallback(request, env, db) {
       );
     }
 
+    // Get Google account information
     const userInfoResponse = await fetch(
       GOOGLE_USERINFO_URL,
       {
@@ -577,7 +655,10 @@ async function handleGoogleCallback(request, env, db) {
     const googleUser = await userInfoResponse.json();
 
     if (!userInfoResponse.ok) {
-      console.error('Google userinfo failed:', googleUser);
+      console.error(
+        'Google userinfo failed:',
+        googleUser
+      );
 
       return googleErrorRedirect(
         request,
@@ -586,9 +667,18 @@ async function handleGoogleCallback(request, env, db) {
       );
     }
 
-    const googleSub = cleanString(googleUser.sub, 255);
-    const googleEmail = cleanString(googleUser.email, 320);
-    const emailVerified = googleUser.email_verified === true;
+    const googleSub = cleanString(
+      googleUser.sub,
+      255
+    );
+
+    const googleEmail = cleanString(
+      googleUser.email,
+      320
+    );
+
+    const emailVerified =
+      googleUser.email_verified === true;
 
     if (!googleSub) {
       return googleErrorRedirect(
@@ -614,23 +704,68 @@ async function handleGoogleCallback(request, env, db) {
       );
     }
 
+    /*
+     * Check whether this Google account is already
+     * attached to another EcE Hub account.
+     */
     const existingGoogleUser = await db.prepare(`
       SELECT
         id,
         username,
-        display_name
+        display_name,
+        google_sub,
+        google_email
       FROM users
       WHERE google_sub = ?
     `).bind(googleSub).first();
 
-    if (existingGoogleUser && existingGoogleUser.id !== userId) {
-      return googleErrorRedirect(
-        request,
-        env,
-        'google_account_already_linked'
+    /*
+     * Google account belongs to another EcE Hub account.
+     *
+     * Merge the current guest account into the existing
+     * Google account, then switch the browser session
+     * to that existing account.
+     */
+    if (
+      existingGoogleUser &&
+      existingGoogleUser.id !== userId
+    ) {
+      await mergeGuestIntoGoogleUser(
+        db,
+        userId,
+        existingGoogleUser.id
       );
+
+      const token = await createSession(
+        existingGoogleUser.id,
+        env.SESSION_SECRET
+      );
+
+      const redirectUrl = new URL(
+        getFrontendOrigin(env, request)
+      );
+
+      redirectUrl.searchParams.set(
+        'community_google_linked',
+        '1'
+      );
+
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: redirectUrl.toString(),
+          'Set-Cookie': [
+            setSessionCookie(token),
+            clearGoogleStateCookie()
+          ]
+        }
+      });
     }
 
+    /*
+     * Make sure this Google email isn't already
+     * linked to a different EcE Hub account.
+     */
     const existingEmailUser = await db.prepare(`
       SELECT
         id,
@@ -638,7 +773,10 @@ async function handleGoogleCallback(request, env, db) {
       FROM users
       WHERE google_email = ?
         AND id <> ?
-    `).bind(googleEmail, userId).first();
+    `).bind(
+      googleEmail,
+      userId
+    ).first();
 
     if (existingEmailUser) {
       return googleErrorRedirect(
@@ -648,31 +786,81 @@ async function handleGoogleCallback(request, env, db) {
       );
     }
 
-    await db.prepare(`
-      UPDATE users
-      SET
-        google_sub = ?,
-        google_email = ?,
-        google_email_verified = ?,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).bind(
-      googleSub,
-      googleEmail,
-      emailVerified ? 1 : 0,
-      userId
-    ).run();
+    /*
+     * Normal case:
+     *
+     * Attach Google to the CURRENT EcE Hub user.
+     *
+     * IMPORTANT:
+     * We intentionally keep userId unchanged.
+     */
+const updateResult = await db.prepare(`
+  UPDATE users
+  SET
+    google_sub = ?,
+    google_email = ?,
+    google_email_verified = ?,
+    updated_at = CURRENT_TIMESTAMP
+  WHERE id = ?
+`).bind(
+  googleSub,
+  googleEmail,
+  emailVerified ? 1 : 0,
+  userId
+).run();
 
-    return new Response(null, {
-      status: 302,
-      headers: {
-        Location: getFrontendOrigin(env, request),
-        'Set-Cookie': clearGoogleStateCookie()
-      }
-    });
+console.log('=== GOOGLE LINK UPDATE ===');
+console.log(JSON.stringify({
+  userId,
+  googleSub,
+  googleEmail,
+  emailVerified,
+  changes: updateResult.meta?.changes,
+  success: updateResult.success
+}));
+
+// VERY IMPORTANT:
+// Do not redirect as "success" unless the database
+// actually contains the Google information.
+const verify = await db.prepare(`
+  SELECT
+    id,
+    username,
+    google_sub,
+    google_email,
+    google_email_verified
+  FROM users
+  WHERE id = ?
+`).bind(userId).first();
+
+console.log('=== GOOGLE LINK VERIFY ===');
+console.log(JSON.stringify(verify));
+
+if (
+  !verify ||
+  verify.id !== userId ||
+  verify.google_sub !== googleSub ||
+  verify.google_email !== googleEmail ||
+  Number(verify.google_email_verified) !== 1
+) {
+  console.error(
+    '=== GOOGLE LINK FAILED VERIFICATION ==='
+  );
+
+  return googleErrorRedirect(
+    request,
+    env,
+    'google_link_database_update_failed'
+  );
+}
+
+return googleSuccessRedirect(request, env);
 
   } catch (err) {
-    console.error('Google linking error:', err);
+    console.error(
+      'Google linking error:',
+      err
+    );
 
     return googleErrorRedirect(
       request,
@@ -1684,8 +1872,171 @@ async function handleWorkspace(
  * MAIN ROUTER
  */
 
-export async function handleCommunity(request, env, origin) {
+async function handleCommunitySearch(
+  request,
+  env,
+  db,
+  origin
+) {
+  if (request.method !== 'GET') {
+    return errorResponse(
+      'Method not allowed.',
+      405,
+      origin
+    );
+  }
 
+  const url = new URL(request.url);
+
+  const query = cleanString(
+    url.searchParams.get('q'),
+    100
+  );
+
+  if (!query) {
+    return json(
+      {
+        query: '',
+        users: [],
+        flashcards: []
+      },
+      200,
+      origin
+    );
+  }
+
+  /*
+   * Escape SQLite LIKE wildcard characters.
+   */
+  const escapedQuery = query
+    .replaceAll('\\', '\\\\')
+    .replaceAll('%', '\\%')
+    .replaceAll('_', '\\_');
+
+  const pattern = `%${escapedQuery}%`;
+
+  /*
+   * USERS
+   */
+  const usersResult = await db.prepare(`
+    SELECT
+      id,
+      username,
+      display_name,
+      avatar_url,
+      bio
+    FROM users
+    WHERE
+      username LIKE ? ESCAPE '\\'
+      OR display_name LIKE ? ESCAPE '\\'
+    ORDER BY
+      CASE
+        WHEN username = ? COLLATE NOCASE THEN 0
+        WHEN display_name = ? COLLATE NOCASE THEN 1
+        ELSE 2
+      END,
+      username COLLATE NOCASE
+    LIMIT 20
+  `)
+    .bind(
+      pattern,
+      pattern,
+      query,
+      query
+    )
+    .all();
+
+  /*
+   * PUBLIC FLASHCARD SETS
+   */
+  const flashcardsResult = await db.prepare(`
+    SELECT
+      fs.id,
+      fs.title,
+      fs.subject,
+      fs.description,
+      fs.card_count,
+      fs.created_at,
+      fs.updated_at,
+
+      u.id AS author_id,
+      u.username AS author_username,
+      u.display_name AS author_display_name,
+      u.avatar_url AS author_avatar_url
+
+    FROM flashcard_sets fs
+
+    INNER JOIN users u
+      ON u.id = fs.author_id
+
+    WHERE
+      fs.visibility = 'public'
+      AND (
+        fs.title LIKE ? ESCAPE '\\'
+        OR fs.subject LIKE ? ESCAPE '\\'
+        OR fs.description LIKE ? ESCAPE '\\'
+        OR u.username LIKE ? ESCAPE '\\'
+        OR u.display_name LIKE ? ESCAPE '\\'
+      )
+
+    ORDER BY
+      CASE
+        WHEN fs.title = ? COLLATE NOCASE THEN 0
+        ELSE 1
+      END,
+      fs.updated_at DESC
+
+    LIMIT 30
+  `)
+    .bind(
+      pattern,
+      pattern,
+      pattern,
+      pattern,
+      pattern,
+      query
+    )
+    .all();
+
+  const users =
+    usersResult.results.map(user => ({
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+      avatarUrl: user.avatar_url,
+      bio: user.bio
+    }));
+
+  const flashcards =
+    flashcardsResult.results.map(set => ({
+      id: set.id,
+      title: set.title,
+      subject: set.subject,
+      description: set.description,
+      cardCount: Number(set.card_count || 0),
+      createdAt: set.created_at,
+      updatedAt: set.updated_at,
+
+      author: {
+        id: set.author_id,
+        username: set.author_username,
+        displayName: set.author_display_name,
+        avatarUrl: set.author_avatar_url
+      }
+    }));
+
+  return json(
+    {
+      query,
+      users,
+      flashcards
+    },
+    200,
+    origin
+  );
+}
+
+export async function handleCommunity(request, env, origin) {
   // CORS preflight
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -1703,8 +2054,8 @@ export async function handleCommunity(request, env, origin) {
   }
 
   const db = env.DB;
-  const url =
-    new URL(request.url);
+  const url = new URL(request.url);
+  const pathname = url.pathname;
 
   const parts =
     url.pathname
@@ -1767,6 +2118,15 @@ export async function handleCommunity(request, env, origin) {
 
   if (url.pathname === '/api/users/me') {
     return handleProfile(request, env, db, origin);
+  }
+
+  if (url.pathname === '/api/search') {
+    return handleCommunitySearch(
+      request,
+      env,
+      db,
+      origin
+    );
   }
 
   if (
